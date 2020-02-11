@@ -1,0 +1,11 @@
+[package]
+name = "actix-messages"
+version = "0.1.0"
+authors = ["Yousuf Nejati"]
+edition = "2018"
+
+[dependencies]
+actix-web = { git = "https://github.com/actix/actix-web", branch = "1.0" }
+env_logger = "0.6"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
