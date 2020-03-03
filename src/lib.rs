@@ -2,14 +2,20 @@
 #[macro_use]
 extern crate actix_web;
 
-use actix_web::{ middleware, web, App, HttpServer, Result };
+use actix_web::{ 
+  error::{Error, InternalError, JsonPayloadError},
+  middleware, web, App, HttpRequest, HttpResponse, HttpServer, Result,
+};
 use serde::Serialize;
+use serde::Deserialize;
 use std::cell::Cell;
 // Tools needed to work with a usize that can be modified atomically and thefore threadsafe.
 use std::sync::atomic::{AtomicUsize, Ordering};
 // Tools to safely share and mutate things that are not atomic accross multiple threads.
 use std::sync::{Arc, Mutex};
 
+// Raw string, to allow qutoes inside string without escape
+const LOG_FORMAT: &'static str= r#""%r" %s %b "%{User-Agent}i" %D"#;
 static SERVER_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 // Handlers
@@ -19,6 +25,32 @@ struct IndexResponse {
   server_id: usize,
   request_count: usize,
   messages: Vec<String>
+}
+
+#[derive(Serialize)]
+struct PostError {
+  server_id: usize,
+  request_count: usize,
+  error: String
+}
+
+#[derive(Deserialize)]
+struct PostInput {
+    message: String,
+}
+
+#[derive(Serialize)]
+struct PostResponse {
+    server_id: usize,
+    request_count: usize,
+    message: String,
+}
+
+#[derive(Serialize)]
+struct LookupResponse {
+  server_id: usize,
+  request_count: usize,
+  result: Option<String>,
 }
 
 // Each worker thread will get own instance of this struct.
@@ -39,6 +71,61 @@ fn index(state: web::Data<AppState>) -> Result<web::Json<IndexResponse>> {
     request_count,
     messages: ms.clone()
   }))
+}
+
+#[post("/clear")]
+fn clear(state: web::Data<AppState>) -> Result<web::Json<IndexResponse>> {
+    let request_count = state.request_count.get() + 1;
+    state.request_count.set(request_count);
+    let mut ms = state.messages.lock().unwrap();
+    ms.clear();
+
+    Ok(web::Json(IndexResponse {
+        server_id: state.server_id,
+        request_count,
+        messages: vec![],
+    }))
+}
+
+#[get("/lookup/{index}")]
+fn lookup(state: web::Data<AppState>, idx: web::Path<usize>) -> Result<web::Json<LookupResponse>> {
+  let request_count = state.request_count.get() + 1;
+  state.request_count.set(request_count);
+  let ms = state.messages.lock().unwrap();
+  let result = ms.get(idx.into_inner()).cloned();
+  Ok(web::Json(LookupResponse {
+    server_id: state.server_id,
+    request_count,
+    result,
+  }))
+}
+
+// Input handler
+fn post(msg: web::Json<PostInput>, state: web::Data<AppState>) -> Result<web::Json<PostResponse>> {
+  let request_count = state.request_count.get() + 1;
+  state.request_count.set(request_count);
+  let mut ms = state.messages.lock().unwrap();
+  ms.push(msg.message.clone());
+
+  Ok(web::Json(PostResponse {
+      server_id: state.server_id,
+      request_count,
+      // Clone becuase the vector is owner.
+      message: msg.message.clone(),
+  }))
+}
+
+fn post_error(err: JsonPayloadError, req: &HttpRequest) -> Error {
+  let extns = req.extensions();
+  let state = extns.get::<web::Data<AppState>>().unwrap();
+  let request_count = state.request_count.get() + 1;
+  state.request_count.set(request_count);
+  let post_error = PostError {
+    server_id: state.server_id,
+    request_count,
+    error: format!("{}", err),
+  };
+  InternalError::from_response(err, HttpResponse::BadRequest().json(post_error)).into()
 }
 
 pub struct MessageApp {
@@ -62,8 +149,11 @@ impl MessageApp {
           request_count: Cell::new(0),
           messages: messages.clone(),
         })
-        .wrap(middleware::Logger::default())
-        .service(index)
+        .wrap(middleware::Logger::new(LOG_FORMAT))
+        .service(index) // index resource using attribute method
+        .service(clear)
+        // .service(send)
+        .service(lookup)
     })
     .bind(("127.0.0.1", self.port))?
     .workers(8)
